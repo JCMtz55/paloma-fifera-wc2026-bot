@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, PicklePersistence
 
 from schedule import MATCHES
 
@@ -80,6 +80,18 @@ def fmt_match(match: dict, now: datetime) -> str:
 
 def future_matches(now: datetime) -> list:
     return sorted([m for m in MATCHES if m["kickoff"] > now], key=lambda m: m["kickoff"])
+
+
+def find_team(query: str) -> str | None:
+    """Return the exact team name from MATCHES that matches the query, or None."""
+    q = query.lower()
+    all_teams = {m["home"] for m in MATCHES} | {m["away"] for m in MATCHES}
+    matches = [t for t in all_teams if q in t.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    # Prefer exact match if multiple partial matches
+    exact = [t for t in matches if t.lower() == q]
+    return exact[0] if exact else (matches[0] if len(matches) > 0 else None)
 
 
 # ------------------------------------------------------------------ #
@@ -234,6 +246,85 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /register Mexico")
+        return
+
+    team = find_team(" ".join(context.args))
+    if not team:
+        await update.message.reply_text(f"❌ Team not found. Check the spelling and try again.")
+        return
+
+    user_id = str(update.effective_user.id)
+    registrations: dict = context.bot_data.setdefault("registrations", {})
+    user_teams: list = registrations.setdefault(user_id, [])
+
+    if team in user_teams:
+        await update.message.reply_text(f"You already have *{team}* registered.", parse_mode="Markdown")
+        return
+
+    user_teams.append(team)
+    await update.message.reply_text(f"✅ *{team}* added to your teams.", parse_mode="Markdown")
+
+
+async def cmd_unregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Usage: /unregister Mexico")
+        return
+
+    team = find_team(" ".join(context.args))
+    user_id = str(update.effective_user.id)
+    registrations: dict = context.bot_data.get("registrations", {})
+    user_teams: list = registrations.get(user_id, [])
+
+    if not team or team not in user_teams:
+        await update.message.reply_text(f"❌ That team isn't in your list.")
+        return
+
+    user_teams.remove(team)
+    await update.message.reply_text(f"✅ *{team}* removed from your teams.", parse_mode="Markdown")
+
+
+async def cmd_myteams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = datetime.now(tz=UTC)
+    user_id = str(update.effective_user.id)
+    registrations: dict = context.bot_data.get("registrations", {})
+    user_teams: list = registrations.get(user_id, [])
+
+    if not user_teams:
+        await update.message.reply_text(
+            "You have no teams registered. Use /register Mexico to add one."
+        )
+        return
+
+    lines = [f"⭐ *Your teams:*\n"]
+    for team in user_teams:
+        team_matches = [
+            m for m in MATCHES
+            if m["home"] == team or m["away"] == team
+        ]
+        next_match = next((m for m in sorted(team_matches, key=lambda m: m["kickoff"]) if m["kickoff"] > now), None)
+
+        if next_match:
+            opponent = next_match["away"] if next_match["home"] == team else next_match["home"]
+            side = "vs" if next_match["home"] == team else "@"
+            time_until = next_match["kickoff"] - now
+            mins = int(time_until.total_seconds() // 60)
+            days, rem = divmod(mins, 1440)
+            hours, minutes = divmod(rem, 60)
+            countdown = f"{days}d {hours}h {minutes}m" if days > 0 else f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+            lines.append(
+                f"🏳 *{team}*\n"
+                f"Next: {side} {opponent}  —  {group_label(next_match.get('group', ''))} MD{next_match.get('matchday', '?')}\n"
+                f"📍 {next_match.get('venue', '')}  •  🕐 {fmt_time(next_match['kickoff'])}  •  ⏳ in {countdown}"
+            )
+        else:
+            lines.append(f"🏳 *{team}*\nNo upcoming matches.")
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "⚽ *World Cup 2026 Bot*\n\n"
@@ -246,6 +337,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/tomorrow — All matches tomorrow\n"
         "/group A — Full schedule for a group \\(A–L\\)\n"
         "/schedule Mexico — All matches for a specific team\n"
+        "/register Mexico — Add a team to your personal list\n"
+        "/unregister Mexico — Remove a team from your list\n"
+        "/myteams — Your teams and their next matches\n"
         "/help — Show this message"
     )
     await update.message.reply_text(text, parse_mode="MarkdownV2")
@@ -256,7 +350,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ------------------------------------------------------------------ #
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
+    persistence = PicklePersistence(filepath="bot_data.pkl")
+    app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
 
     app.add_handler(CommandHandler("upcoming", cmd_upcoming))
     app.add_handler(CommandHandler("next", cmd_next))
@@ -264,6 +359,9 @@ def main() -> None:
     app.add_handler(CommandHandler("tomorrow", cmd_tomorrow))
     app.add_handler(CommandHandler("group", cmd_group))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("register", cmd_register))
+    app.add_handler(CommandHandler("unregister", cmd_unregister))
+    app.add_handler(CommandHandler("myteams", cmd_myteams))
     app.add_handler(CommandHandler("help", cmd_help))
 
     app.job_queue.run_repeating(check_schedule, interval=60, first=10)
