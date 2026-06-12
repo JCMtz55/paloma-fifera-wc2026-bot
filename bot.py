@@ -79,6 +79,11 @@ def fmt_match(match: dict, now: datetime) -> str:
     )
 
 
+def save_user_name(context: ContextTypes.DEFAULT_TYPE, user) -> None:
+    user_names: dict = context.bot_data.setdefault("user_names", {})
+    user_names[str(user.id)] = user.first_name or f"User{str(user.id)[-4:]}"
+
+
 def future_matches(now: datetime) -> list:
     return sorted([m for m in MATCHES if m["kickoff"] > now], key=lambda m: m["kickoff"])
 
@@ -126,6 +131,7 @@ async def check_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ------------------------------------------------------------------ #
 
 async def cmd_upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user_name(context, update.effective_user)
     now = datetime.now(tz=UTC)
     matches = future_matches(now)[:3]
 
@@ -312,6 +318,7 @@ async def cmd_unregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_myteams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user_name(context, update.effective_user)
     now = datetime.now(tz=UTC)
     user_id = str(update.effective_user.id)
     registrations: dict = context.bot_data.get("registrations", {})
@@ -398,6 +405,7 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user_name(context, update.effective_user)
     registrations: dict = context.bot_data.get("registrations", {})
     user_names: dict = context.bot_data.get("user_names", {})
     team_results: dict = context.bot_data.get("team_results", {})
