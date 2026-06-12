@@ -14,6 +14,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -284,6 +285,11 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     user_teams.append(team)
+
+    # Store display name for leaderboard
+    user_names: dict = context.bot_data.setdefault("user_names", {})
+    user_names[user_id] = update.effective_user.first_name or f"User{user_id[-4:]}"
+
     await update.message.reply_text(f"✅ *{team}* added to your teams.", parse_mode="Markdown")
 
 
@@ -344,6 +350,79 @@ async def cmd_myteams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You don't have permission to use this command.")
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text("Usage: /result Mexico win 3\nResult must be: win, tie, or loss")
+        return
+
+    team = find_team(context.args[0])
+    if not team:
+        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+        return
+
+    result_type = context.args[1].lower()
+    if result_type not in ("win", "tie", "loss"):
+        await update.message.reply_text("❌ Result must be: win, tie, or loss")
+        return
+
+    try:
+        goals = int(context.args[2])
+    except ValueError:
+        await update.message.reply_text("❌ Goals must be a number.")
+        return
+
+    points = {"win": 2, "tie": 1, "loss": 0}[result_type]
+
+    team_results: dict = context.bot_data.setdefault("team_results", {})
+    if team not in team_results:
+        team_results[team] = {"points": 0, "goals": 0}
+    team_results[team]["points"] += points
+    team_results[team]["goals"] += goals
+
+    result_emoji = {"win": "✅", "tie": "🤝", "loss": "❌"}[result_type]
+    await update.message.reply_text(
+        f"{result_emoji} *{team}* — {result_type} | {goals} goals | +{points} pts",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    registrations: dict = context.bot_data.get("registrations", {})
+    user_names: dict = context.bot_data.get("user_names", {})
+    team_results: dict = context.bot_data.get("team_results", {})
+
+    if not registrations:
+        await update.message.reply_text("No users registered yet. Use /register to join.")
+        return
+
+    scores = []
+    for user_id, teams in registrations.items():
+        if not teams:
+            continue
+        total_points = sum(team_results.get(t, {}).get("points", 0) for t in teams)
+        total_goals = sum(team_results.get(t, {}).get("goals", 0) for t in teams)
+        name = user_names.get(user_id, f"User{user_id[-4:]}")
+        scores.append({"name": name, "points": total_points, "goals": total_goals, "teams": teams})
+
+    scores.sort(key=lambda x: (-x["points"], -x["goals"]))
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🏆 *Leaderboard:*\n"]
+    for i, s in enumerate(scores):
+        rank = medals[i] if i < 3 else f"{i + 1}\\."
+        teams_str = " • ".join(s["teams"])
+        lines.append(
+            f"{rank} *{s['name']}* — {s['points']} pts | {s['goals']} goals\n"
+            f"   {teams_str}"
+        )
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "⚽ *World Cup 2026 Bot*\n\n"
@@ -360,6 +439,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/register Mexico — Add a team to your personal list\n"
         "/unregister Mexico — Remove a team from your list\n"
         "/myteams — Your teams and their next matches\n"
+        "/result Mexico win 3 — Log a match result (win/tie/loss + goals)\n"
+        "/leaderboard — Show standings with points and goals\n"
         "/help — Show this message"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -384,6 +465,8 @@ def main() -> None:
     app.add_handler(CommandHandler("register", cmd_register))
     app.add_handler(CommandHandler("unregister", cmd_unregister))
     app.add_handler(CommandHandler("myteams", cmd_myteams))
+    app.add_handler(CommandHandler("result", cmd_result))
+    app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
     app.add_handler(CommandHandler("help", cmd_help))
 
     app.job_queue.run_repeating(check_schedule, interval=60, first=10)
