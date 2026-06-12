@@ -350,7 +350,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ------------------------------------------------------------------ #
 
 def main() -> None:
-    persistence = PicklePersistence(filepath="bot_data.pkl")
+    data_path = os.getenv("DATA_PATH", ".")
+    persistence = PicklePersistence(filepath=os.path.join(data_path, "bot_data.pkl"))
     app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
 
     app.add_handler(CommandHandler("upcoming", cmd_upcoming))
