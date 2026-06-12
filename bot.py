@@ -359,20 +359,27 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Usage: /result Mexico win 3\nResult must be: win, tie, or loss")
         return
 
-    team = find_team(context.args[0])
-    if not team:
-        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+    # Find where the result keyword is — everything before it is the team name
+    result_keywords = ("win", "tie", "loss")
+    split_index = next(
+        (i for i, a in enumerate(context.args) if a.lower() in result_keywords), None
+    )
+    if split_index is None or split_index == 0:
+        await update.message.reply_text("❌ Result must be: win, tie, or loss\nUsage: /result South Korea win 3")
         return
 
-    result_type = context.args[1].lower()
-    if result_type not in ("win", "tie", "loss"):
-        await update.message.reply_text("❌ Result must be: win, tie, or loss")
-        return
+    team_query = " ".join(context.args[:split_index])
+    result_type = context.args[split_index].lower()
 
     try:
-        goals = int(context.args[2])
-    except ValueError:
-        await update.message.reply_text("❌ Goals must be a number.")
+        goals = int(context.args[split_index + 1])
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ Goals must be a number.\nUsage: /result South Korea win 3")
+        return
+
+    team = find_team(team_query)
+    if not team:
+        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
         return
 
     points = {"win": 2, "tie": 1, "loss": 0}[result_type]
