@@ -246,6 +246,25 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_teams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    groups: dict[str, list] = {}
+    for m in MATCHES:
+        g = m.get("group", "?")
+        if g not in groups:
+            groups[g] = []
+        for team in (m["home"], m["away"]):
+            if team not in groups[g]:
+                groups[g].append(team)
+
+    lines = ["🌍 *World Cup 2026 Teams:*\n"]
+    for g in sorted(groups):
+        teams = sorted(groups[g])
+        lines.append(f"*Group {g}:* {' • '.join(teams)}")
+
+    lines.append("\nUse /register followed by the team name to add it to your list.")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
         await update.message.reply_text("Usage: /register Mexico")
@@ -335,14 +354,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/next — The very next match\n"
         "/today — All matches today\n"
         "/tomorrow — All matches tomorrow\n"
-        "/group A — Full schedule for a group \\(A–L\\)\n"
+        "/group A — Full schedule for a group (A-L)\n"
         "/schedule Mexico — All matches for a specific team\n"
+        "/teams — List all teams by group\n"
         "/register Mexico — Add a team to your personal list\n"
         "/unregister Mexico — Remove a team from your list\n"
         "/myteams — Your teams and their next matches\n"
         "/help — Show this message"
     )
-    await update.message.reply_text(text, parse_mode="MarkdownV2")
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 # ------------------------------------------------------------------ #
@@ -360,6 +380,7 @@ def main() -> None:
     app.add_handler(CommandHandler("tomorrow", cmd_tomorrow))
     app.add_handler(CommandHandler("group", cmd_group))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("teams", cmd_teams))
     app.add_handler(CommandHandler("register", cmd_register))
     app.add_handler(CommandHandler("unregister", cmd_unregister))
     app.add_handler(CommandHandler("myteams", cmd_myteams))
