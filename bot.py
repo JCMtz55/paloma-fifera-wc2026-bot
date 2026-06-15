@@ -32,8 +32,10 @@ LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 
 KNOCKOUT_LABELS = {
     "R32": "Round of 32", "R16": "Round of 16", "QF": "Quarterfinal",
-    "SF": "Semifinal", "3rd": "Third Place", "F": "Final",
+    "SF": "Semifinal", "3RD": "Third Place", "FIN": "Final",
 }
+
+GROUP_STAGE = set("ABCDEFGHIJKL")
 
 
 # ------------------------------------------------------------------ #
@@ -41,7 +43,9 @@ KNOCKOUT_LABELS = {
 # ------------------------------------------------------------------ #
 
 def group_label(group: str) -> str:
-    return KNOCKOUT_LABELS.get(group, f"Group {group}")
+    if group in GROUP_STAGE:
+        return f"Group {group}"
+    return KNOCKOUT_LABELS.get(group, group)
 
 
 def fmt_time(kickoff_utc: datetime) -> str:
@@ -50,14 +54,17 @@ def fmt_time(kickoff_utc: datetime) -> str:
     return f"{local.strftime('%b %d, %I:%M %p')} {tz_abbr}"
 
 
-def fmt_alert(match: dict) -> str:
-    return (
+def fmt_alert(match: dict, mentions: list[str] | None = None) -> str:
+    text = (
         f"⚽ *Match starting in 1 hour!*\n\n"
         f"🆚 {match['home']} vs {match['away']}\n"
         f"🏆 {group_label(match.get('group', ''))}\n"
         f"📍 {match.get('venue', '')}\n"
         f"🕐 Kickoff: {fmt_time(match['kickoff'])}"
     )
+    if mentions:
+        text += "\n\n" + " ".join(mentions)
+    return text
 
 
 def fmt_match(match: dict, now: datetime) -> str:
@@ -115,9 +122,19 @@ async def check_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
         if timedelta(minutes=55) <= time_until <= timedelta(minutes=65):
             if match_id not in notified:
                 try:
+                    registrations: dict = context.bot_data.get("registrations", {})
+                    user_names: dict = context.bot_data.get("user_names", {})
+                    teams_in_match = {match["home"], match["away"]}
+
+                    mentions = [
+                        f"[{user_names.get(uid, 'Fan')}](tg://user?id={uid})"
+                        for uid, teams in registrations.items()
+                        if teams_in_match & set(teams)
+                    ]
+
                     await context.bot.send_message(
                         chat_id=CHAT_ID,
-                        text=fmt_alert(match),
+                        text=fmt_alert(match, mentions),
                         parse_mode="Markdown",
                     )
                     notified.add(match_id)
