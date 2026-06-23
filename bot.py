@@ -421,6 +421,57 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You don't have permission to use this command.")
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Usage: /adjust Mexico -2 -3\n"
+            "First number = points delta, second = goals delta\n"
+            "Use negative numbers to subtract."
+        )
+        return
+
+    # Find where numbers start — everything before is the team name
+    split_index = next(
+        (i for i, a in enumerate(context.args) if a.lstrip("+-").isdigit()), None
+    )
+    if split_index is None or split_index == 0:
+        await update.message.reply_text("❌ Could not parse command. Usage: /adjust Mexico -2 -3")
+        return
+
+    team_query = " ".join(context.args[:split_index])
+    team = find_team(team_query)
+    if not team:
+        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+        return
+
+    try:
+        points_delta = int(context.args[split_index])
+        goals_delta = int(context.args[split_index + 1])
+    except (IndexError, ValueError):
+        await update.message.reply_text("❌ Points and goals must be numbers. Usage: /adjust Mexico -2 -3")
+        return
+
+    team_results: dict = context.bot_data.setdefault("team_results", {})
+    if team not in team_results:
+        team_results[team] = {"points": 0, "goals": 0}
+
+    team_results[team]["points"] += points_delta
+    team_results[team]["goals"] += goals_delta
+
+    p = team_results[team]["points"]
+    g = team_results[team]["goals"]
+    await update.message.reply_text(
+        f"✅ *{team}* adjusted.\n"
+        f"Points: {'+' if points_delta >= 0 else ''}{points_delta} → *{p} pts total*\n"
+        f"Goals: {'+' if goals_delta >= 0 else ''}{goals_delta} → *{g} goals total*",
+        parse_mode="Markdown",
+    )
+
+
 async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_user_name(context, update.effective_user)
     registrations: dict = context.bot_data.get("registrations", {})
@@ -498,6 +549,7 @@ def main() -> None:
     app.add_handler(CommandHandler("unregister", cmd_unregister))
     app.add_handler(CommandHandler("myteams", cmd_myteams))
     app.add_handler(CommandHandler("result", cmd_result))
+    app.add_handler(CommandHandler("adjust", cmd_adjust))
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
     app.add_handler(CommandHandler("help", cmd_help))
 
