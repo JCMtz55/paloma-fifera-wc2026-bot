@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import httpx
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import TelegramError
@@ -15,6 +16,18 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
+FOOTBALL_API_URL = "https://api.football-data.org/v4/competitions/WC/matches"
+
+STAGE_MAP = {
+    "GROUP_STAGE": None,        # handled by group letter
+    "ROUND_OF_32": "R32",
+    "LAST_16": "R16",
+    "QUARTER_FINALS": "QF",
+    "SEMI_FINALS": "SF",
+    "THIRD_PLACE": "3RD",
+    "FINAL": "FIN",
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,8 +121,38 @@ def save_user_name(context: ContextTypes.DEFAULT_TYPE, user) -> None:
     user_names[str(user.id)] = user.first_name or f"User{str(user.id)[-4:]}"
 
 
-def future_matches(now: datetime) -> list:
-    return sorted([m for m in MATCHES if m["kickoff"] > now], key=lambda m: m["kickoff"])
+def all_matches(context: ContextTypes.DEFAULT_TYPE) -> list:
+    return MATCHES + context.bot_data.get("dynamic_matches", [])
+
+
+def future_matches(now: datetime, context: ContextTypes.DEFAULT_TYPE) -> list:
+    return sorted([m for m in all_matches(context) if m["kickoff"] > now], key=lambda m: m["kickoff"])
+
+
+def map_api_match(api_match: dict) -> dict | None:
+    home = api_match.get("homeTeam", {}).get("name", "TBD")
+    away = api_match.get("awayTeam", {}).get("name", "TBD")
+    utc_date = api_match.get("utcDate", "")
+    if not utc_date or home == "TBD" or away == "TBD":
+        return None
+
+    kickoff = datetime.fromisoformat(utc_date.replace("Z", "+00:00"))
+    stage = api_match.get("stage", "")
+    raw_group = api_match.get("group") or ""
+
+    if stage == "GROUP_STAGE" and raw_group:
+        group = raw_group.replace("GROUP_", "")[:1]
+    else:
+        group = STAGE_MAP.get(stage, stage)
+
+    return {
+        "home": home,
+        "away": away,
+        "kickoff": kickoff,
+        "group": group,
+        "matchday": api_match.get("matchday"),
+        "venue": api_match.get("venue") or "",
+    }
 
 
 def find_team(query: str) -> str | None:
@@ -132,7 +175,7 @@ async def check_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(tz=UTC)
     notified: set = context.bot_data.setdefault("notified", set())
 
-    for match in MATCHES:
+    for match in all_matches(context):
         match_id = f"{match['home']}-{match['away']}-{match['kickoff'].isoformat()}"
         time_until = match["kickoff"] - now
 
@@ -184,13 +227,71 @@ async def check_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ------------------------------------------------------------------ #
+#  Daily API sync                                                      #
+# ------------------------------------------------------------------ #
+
+async def sync_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not FOOTBALL_API_KEY:
+        log.warning("FOOTBALL_API_KEY not set — skipping sync.")
+        return
+
+    now = datetime.now(tz=UTC)
+    date_from = now.strftime("%Y-%m-%d")
+    date_to = (now + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(
+                FOOTBALL_API_URL,
+                headers={"X-Auth-Token": FOOTBALL_API_KEY},
+                params={"dateFrom": date_from, "dateTo": date_to, "season": 2026},
+                timeout=10,
+            )
+            r.raise_for_status()
+            api_matches = r.json().get("matches", [])
+    except Exception as e:
+        log.error(f"Schedule sync failed: {e}")
+        return
+
+    dynamic_matches: list = context.bot_data.setdefault("dynamic_matches", [])
+    existing = {(m["home"], m["away"]) for m in MATCHES + dynamic_matches}
+
+    new_matches = []
+    for api_match in api_matches:
+        mapped = map_api_match(api_match)
+        if not mapped:
+            continue
+        key = (mapped["home"], mapped["away"])
+        if key not in existing:
+            dynamic_matches.append(mapped)
+            existing.add(key)
+            new_matches.append(mapped)
+            log.info(f"New match added: {mapped['home']} vs {mapped['away']}")
+
+    if new_matches:
+        lines = ["📋 *Schedule updated — new matches announced:*\n"]
+        for m in new_matches:
+            lines.append(
+                f"🆚 *{m['home']} vs {m['away']}*  —  {group_label(m['group'])}\n"
+                f"🕐 {fmt_time(m['kickoff'])}"
+            )
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text="\n\n".join(lines),
+            parse_mode="Markdown",
+        )
+    else:
+        log.info("Schedule sync complete — no new matches.")
+
+
+# ------------------------------------------------------------------ #
 #  Commands                                                            #
 # ------------------------------------------------------------------ #
 
 async def cmd_upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_user_name(context, update.effective_user)
     now = datetime.now(tz=UTC)
-    matches = future_matches(now)[:3]
+    matches = future_matches(now, context)[:3]
 
     if not matches:
         await update.message.reply_text("No upcoming matches found.")
@@ -203,7 +304,7 @@ async def cmd_upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(tz=UTC)
-    matches = future_matches(now)
+    matches = future_matches(now, context)
 
     if not matches:
         await update.message.reply_text("No upcoming matches found.")
@@ -216,7 +317,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(tz=UTC)
     today_local = now.astimezone(LOCAL_TZ).date()
 
-    matches = [m for m in MATCHES if m["kickoff"].astimezone(LOCAL_TZ).date() == today_local]
+    matches = [m for m in all_matches(context) if m["kickoff"].astimezone(LOCAL_TZ).date() == today_local]
     matches.sort(key=lambda m: m["kickoff"])
 
     if not matches:
@@ -237,7 +338,7 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     now = datetime.now(tz=UTC)
     tomorrow_local = (now.astimezone(LOCAL_TZ) + timedelta(days=1)).date()
 
-    matches = [m for m in MATCHES if m["kickoff"].astimezone(LOCAL_TZ).date() == tomorrow_local]
+    matches = [m for m in all_matches(context) if m["kickoff"].astimezone(LOCAL_TZ).date() == tomorrow_local]
     matches.sort(key=lambda m: m["kickoff"])
 
     if not matches:
@@ -262,7 +363,7 @@ async def cmd_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     letter = context.args[0].upper()
-    matches = [m for m in MATCHES if m.get("group") == letter]
+    matches = [m for m in all_matches(context) if m.get("group") == letter]
     matches.sort(key=lambda m: m["kickoff"])
 
     if not matches:
@@ -288,7 +389,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     team = " ".join(context.args).lower()
     matches = [
-        m for m in MATCHES
+        m for m in all_matches(context)
         if team in m["home"].lower() or team in m["away"].lower()
     ]
     matches.sort(key=lambda m: m["kickoff"])
@@ -390,7 +491,7 @@ async def cmd_myteams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     lines = [f"⭐ *Your teams:*\n"]
     for team in user_teams:
         team_matches = [
-            m for m in MATCHES
+            m for m in all_matches(context)
             if m["home"] == team or m["away"] == team
         ]
         next_match = next((m for m in sorted(team_matches, key=lambda m: m["kickoff"]) if m["kickoff"] > now), None)
@@ -594,6 +695,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
 
     app.job_queue.run_repeating(check_schedule, interval=60, first=10)
+    app.job_queue.run_daily(sync_schedule, time=datetime.strptime("07:00", "%H:%M").time().replace(tzinfo=UTC))
 
     log.info(f"Bot started — monitoring {len(MATCHES)} matches.")
     app.run_polling()
