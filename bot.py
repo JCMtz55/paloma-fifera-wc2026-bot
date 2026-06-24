@@ -67,6 +67,23 @@ def fmt_alert(match: dict, mentions: list[str] | None = None) -> str:
     return text
 
 
+def fmt_showdown(match: dict, home_user: dict, away_user: dict) -> str:
+    return (
+        f"🔥 *SHOWDOWN ALERT!* 🔥\n\n"
+        f"Two of our own are going head to head in *1 hour!*\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"[{home_user['name']}](tg://user?id={home_user['id']}) roots for *{match['home']}*\n"
+        f"📊 {home_user['points']} pts | {home_user['goals']} goals\n\n"
+        f"⚔️\n\n"
+        f"[{away_user['name']}](tg://user?id={away_user['id']}) roots for *{match['away']}*\n"
+        f"📊 {away_user['points']} pts | {away_user['goals']} goals\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"🏆 {group_label(match.get('group', ''))}  •  📍 {match.get('venue', '')}\n"
+        f"🕐 Kickoff: {fmt_time(match['kickoff'])}\n\n"
+        f"May the best team win! 🏆"
+    )
+
+
 def fmt_match(match: dict, now: datetime) -> str:
     time_until = match["kickoff"] - now
     mins = int(time_until.total_seconds() // 60)
@@ -124,17 +141,40 @@ async def check_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     registrations: dict = context.bot_data.get("registrations", {})
                     user_names: dict = context.bot_data.get("user_names", {})
-                    teams_in_match = {match["home"], match["away"]}
+                    team_results: dict = context.bot_data.get("team_results", {})
 
-                    mentions = [
-                        f"[{user_names.get(uid, 'Fan')}](tg://user?id={uid})"
-                        for uid, teams in registrations.items()
-                        if teams_in_match & set(teams)
-                    ]
+                    # Find which user owns each team in this match
+                    home_owner, away_owner = None, None
+                    for uid, teams in registrations.items():
+                        if match["home"] in teams:
+                            home_owner = uid
+                        if match["away"] in teams:
+                            away_owner = uid
+
+                    def user_stats(uid: str, team: str) -> dict:
+                        teams = registrations.get(uid, [])
+                        points = sum(team_results.get(t, {}).get("points", 0) for t in teams)
+                        goals = sum(team_results.get(t, {}).get("goals", 0) for t in teams)
+                        return {
+                            "id": uid,
+                            "name": user_names.get(uid, "Fan"),
+                            "team": team,
+                            "points": points,
+                            "goals": goals,
+                        }
+
+                    if home_owner and away_owner and home_owner != away_owner:
+                        text = fmt_showdown(match, user_stats(home_owner, match["home"]), user_stats(away_owner, match["away"]))
+                    else:
+                        mentions = []
+                        for uid in {home_owner, away_owner} - {None}:
+                            name = user_names.get(uid, "Fan")
+                            mentions.append(f"[{name}](tg://user?id={uid})")
+                        text = fmt_alert(match, mentions or None)
 
                     await context.bot.send_message(
                         chat_id=CHAT_ID,
-                        text=fmt_alert(match, mentions),
+                        text=text,
                         parse_mode="Markdown",
                     )
                     notified.add(match_id)
