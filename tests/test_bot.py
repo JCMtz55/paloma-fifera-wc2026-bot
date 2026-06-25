@@ -10,6 +10,12 @@ from bot import (
     map_api_match,
     find_team,
     group_label,
+    make_match_key,
+    resolve_outcome,
+    result_to_outcome,
+    compute_odds,
+    settle_match,
+    outcome_team_label,
 )
 
 UTC = timezone.utc
@@ -185,3 +191,138 @@ def test_find_team_multi_word():
     assert find_team("new zealand") == "New Zealand"
     assert find_team("saudi") == "Saudi Arabia"
     assert find_team("cape verde") == "Cape Verde"
+
+
+# ------------------------------------------------------------------ #
+#  Betting — make_match_key / resolve_outcome / result_to_outcome     #
+# ------------------------------------------------------------------ #
+
+MATCH = make_match("Mexico", "USA", kickoff(2026, 6, 22, 19))
+
+
+def test_make_match_key():
+    assert make_match_key(MATCH) == "Mexico vs USA"
+
+
+def test_resolve_outcome_home_win():
+    assert resolve_outcome(MATCH, "Mexico", "win") == "home"
+
+
+def test_resolve_outcome_away_win():
+    assert resolve_outcome(MATCH, "USA", "win") == "away"
+
+
+def test_resolve_outcome_draw():
+    assert resolve_outcome(MATCH, "Mexico", "draw") == "draw"
+    assert resolve_outcome(MATCH, "USA", "draw") == "draw"
+
+
+def test_resolve_outcome_team_not_in_match():
+    assert resolve_outcome(MATCH, "Brazil", "win") is None
+
+
+def test_result_to_outcome_home_team():
+    assert result_to_outcome(MATCH, "Mexico", "win") == "home"
+    assert result_to_outcome(MATCH, "Mexico", "loss") == "away"
+    assert result_to_outcome(MATCH, "Mexico", "tie") == "draw"
+
+
+def test_result_to_outcome_away_team():
+    assert result_to_outcome(MATCH, "USA", "win") == "away"
+    assert result_to_outcome(MATCH, "USA", "loss") == "home"
+    assert result_to_outcome(MATCH, "USA", "tie") == "draw"
+
+
+def test_outcome_team_label():
+    assert outcome_team_label(MATCH, "home") == "Mexico"
+    assert outcome_team_label(MATCH, "away") == "USA"
+    assert outcome_team_label(MATCH, "draw") == "Draw"
+
+
+# ------------------------------------------------------------------ #
+#  Betting — compute_odds                                             #
+# ------------------------------------------------------------------ #
+
+def test_compute_odds_empty():
+    odds = compute_odds({})
+    assert odds["total"] == 0
+    assert odds["bettors"] == 0
+    assert odds["home"]["ratio"] == 0.0
+
+
+def test_compute_odds_pools_and_ratios():
+    bets = {
+        "u1": {"outcome": "home", "amount": 100},
+        "u2": {"outcome": "home", "amount": 100},
+        "u3": {"outcome": "away", "amount": 100},
+        "u4": {"outcome": "draw", "amount": 50},
+    }
+    odds = compute_odds(bets)
+    assert odds["total"] == 350
+    assert odds["bettors"] == 4
+    assert odds["home"]["pool"] == 200
+    assert odds["home"]["bets"] == 2
+    assert odds["home"]["ratio"] == 350 / 200
+    assert odds["away"]["ratio"] == 350 / 100
+    assert odds["draw"]["ratio"] == 350 / 50
+
+
+def test_compute_odds_minimum_ratio_is_one():
+    # Solo bettor: pool == total, ratio would be 1.0 (never below)
+    bets = {"u1": {"outcome": "home", "amount": 100}}
+    odds = compute_odds(bets)
+    assert odds["home"]["ratio"] == 1.0
+
+
+# ------------------------------------------------------------------ #
+#  Betting — settle_match                                             #
+# ------------------------------------------------------------------ #
+
+def test_settle_match_basic_payouts():
+    bets = {
+        "u1": {"outcome": "home", "amount": 100},
+        "u2": {"outcome": "away", "amount": 100},
+    }
+    records, no_winners = settle_match(bets, "home")
+    assert not no_winners
+    by_user = {r["user_id"]: r for r in records}
+    # u1 picked home (winner): total 200 / winning pool 100 = 2.0x → 200
+    assert by_user["u1"]["won"] is True
+    assert by_user["u1"]["payout"] == 200
+    # u2 picked away (loser): 0
+    assert by_user["u2"]["won"] is False
+    assert by_user["u2"]["payout"] == 0
+
+
+def test_settle_match_floor_rounding():
+    bets = {
+        "u1": {"outcome": "home", "amount": 100},
+        "u2": {"outcome": "home", "amount": 50},
+        "u3": {"outcome": "away", "amount": 70},
+    }
+    # total 220, winning pool 150
+    records, no_winners = settle_match(bets, "home")
+    by_user = {r["user_id"]: r for r in records}
+    assert by_user["u1"]["payout"] == 146   # floor(100 * 220/150) = floor(146.67)
+    assert by_user["u2"]["payout"] == 73    # floor(50 * 220/150) = floor(73.33)
+    assert by_user["u3"]["payout"] == 0
+
+
+def test_settle_match_no_winners_refunds_all():
+    bets = {
+        "u1": {"outcome": "home", "amount": 100},
+        "u2": {"outcome": "away", "amount": 80},
+    }
+    records, no_winners = settle_match(bets, "draw")
+    assert no_winners
+    by_user = {r["user_id"]: r for r in records}
+    assert by_user["u1"]["payout"] == 100   # stake refunded
+    assert by_user["u2"]["payout"] == 80
+    assert all(r["won"] is False for r in records)
+
+
+def test_settle_match_solo_winner_gets_stake_back():
+    bets = {"u1": {"outcome": "home", "amount": 100}}
+    records, no_winners = settle_match(bets, "home")
+    assert not no_winners
+    assert records[0]["payout"] == 100      # min ratio 1.0x → stake back
