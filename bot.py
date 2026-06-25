@@ -19,6 +19,24 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
 FOOTBALL_API_URL = "https://api.football-data.org/v4/competitions/WC/matches"
 
+# Maps common API name variants to our schedule names
+API_NAME_MAP = {
+    "korea republic": "South Korea",
+    "republic of korea": "South Korea",
+    "ir iran": "Iran",
+    "islamic republic of iran": "Iran",
+    "bosnia and herzegovina": "Bosnia-Herzegovina",
+    "côte d'ivoire": "Ivory Coast",
+    "cote d'ivoire": "Ivory Coast",
+    "united states": "USA",
+    "usa": "USA",
+    "dr congo": "DR Congo",
+    "democratic republic of congo": "DR Congo",
+    "cape verde islands": "Cape Verde",
+    "czechia": "Czech Republic",
+    "republic of ireland": "Ireland",
+}
+
 STAGE_MAP = {
     "GROUP_STAGE": None,        # handled by group letter
     "ROUND_OF_32": "R32",
@@ -122,16 +140,36 @@ def save_user_name(context: ContextTypes.DEFAULT_TYPE, user) -> None:
 
 
 def all_matches(context: ContextTypes.DEFAULT_TYPE) -> list:
-    return MATCHES + context.bot_data.get("dynamic_matches", [])
+    return context.bot_data.get("matches", MATCHES)
 
 
 def future_matches(now: datetime, context: ContextTypes.DEFAULT_TYPE) -> list:
     return sorted([m for m in all_matches(context) if m["kickoff"] > now], key=lambda m: m["kickoff"])
 
 
+def normalize_name(name: str) -> str:
+    return API_NAME_MAP.get(name.lower().strip(), name)
+
+
+def is_duplicate(mapped: dict, existing: list) -> bool:
+    home = mapped["home"].lower()
+    away = mapped["away"].lower()
+    kickoff = mapped["kickoff"]
+    for m in existing:
+        if abs((m["kickoff"] - kickoff).total_seconds()) > 600:
+            continue
+        m_home = m["home"].lower()
+        m_away = m["away"].lower()
+        home_match = home == m_home or any(w in m_home for w in home.split() if len(w) > 3)
+        away_match = away == m_away or any(w in m_away for w in away.split() if len(w) > 3)
+        if home_match and away_match:
+            return True
+    return False
+
+
 def map_api_match(api_match: dict) -> dict | None:
-    home = api_match.get("homeTeam", {}).get("name", "TBD")
-    away = api_match.get("awayTeam", {}).get("name", "TBD")
+    home = normalize_name(api_match.get("homeTeam", {}).get("name", "TBD"))
+    away = normalize_name(api_match.get("awayTeam", {}).get("name", "TBD"))
     utc_date = api_match.get("utcDate", "")
     if not utc_date or home == "TBD" or away == "TBD":
         return None
@@ -235,16 +273,12 @@ async def sync_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.warning("FOOTBALL_API_KEY not set — skipping sync.")
         return
 
-    now = datetime.now(tz=UTC)
-    date_from = now.strftime("%Y-%m-%d")
-    date_to = (now + timedelta(days=7)).strftime("%Y-%m-%d")
-
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(
                 FOOTBALL_API_URL,
                 headers={"X-Auth-Token": FOOTBALL_API_KEY},
-                params={"dateFrom": date_from, "dateTo": date_to, "season": 2026},
+                params={"season": 2026},
                 timeout=10,
             )
             r.raise_for_status()
@@ -253,26 +287,25 @@ async def sync_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.error(f"Schedule sync failed: {e}")
         return
 
-    dynamic_matches: list = context.bot_data.setdefault("dynamic_matches", [])
-    existing = {(m["home"], m["away"]) for m in MATCHES + dynamic_matches}
+    mapped_matches = [m for m in (map_api_match(a) for a in api_matches) if m]
 
-    new_matches = []
-    for api_match in api_matches:
-        mapped = map_api_match(api_match)
-        if not mapped:
-            continue
-        key = (mapped["home"], mapped["away"])
-        if key not in existing:
-            dynamic_matches.append(mapped)
-            existing.add(key)
-            new_matches.append(mapped)
-            log.info(f"New match added: {mapped['home']} vs {mapped['away']}")
+    if not mapped_matches:
+        log.warning("API returned no matches — keeping existing schedule.")
+        return
 
-    if new_matches:
-        lines = ["📋 *Schedule updated — new matches announced:*\n"]
+    previous = context.bot_data.get("matches", [])
+    context.bot_data["matches"] = mapped_matches
+    log.info(f"Schedule synced: {len(mapped_matches)} matches loaded.")
+
+    # Announce newly added matches (e.g. knockout stage fixtures)
+    prev_keys = {(m["home"], m["away"]) for m in previous}
+    new_matches = [m for m in mapped_matches if (m["home"], m["away"]) not in prev_keys]
+
+    if new_matches and previous:  # skip announcement on first sync
+        lines = ["📋 *New matches announced:*\n"]
         for m in new_matches:
             lines.append(
-                f"🆚 *{m['home']} vs {m['away']}*  —  {group_label(m['group'])}\n"
+                f"🆚 *{m['home']} vs {m['away']}*  —  {group_label(m.get('group', ''))}\n"
                 f"🕐 {fmt_time(m['kickoff'])}"
             )
         await context.bot.send_message(
@@ -280,8 +313,6 @@ async def sync_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
             text="\n\n".join(lines),
             parse_mode="Markdown",
         )
-    else:
-        log.info("Schedule sync complete — no new matches.")
 
 
 # ------------------------------------------------------------------ #
@@ -562,6 +593,17 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+
+async def cmd_syncnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You don't have permission to use this command.")
+        return
+    await update.message.reply_text("🔄 Fetching schedule from API...")
+    await sync_schedule(context)
+    count = len(context.bot_data.get("matches", []))
+    await update.message.reply_text(f"✅ Done — {count} matches loaded.")
+
+
 async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("❌ You don't have permission to use this command.")
@@ -689,12 +731,14 @@ def main() -> None:
     app.add_handler(CommandHandler("register", cmd_register))
     app.add_handler(CommandHandler("unregister", cmd_unregister))
     app.add_handler(CommandHandler("myteams", cmd_myteams))
+    app.add_handler(CommandHandler("syncnow", cmd_syncnow))
     app.add_handler(CommandHandler("result", cmd_result))
     app.add_handler(CommandHandler("adjust", cmd_adjust))
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
     app.add_handler(CommandHandler("help", cmd_help))
 
     app.job_queue.run_repeating(check_schedule, interval=60, first=10)
+    app.job_queue.run_once(sync_schedule, when=5)  # sync immediately on startup
     app.job_queue.run_daily(sync_schedule, time=datetime.strptime("07:00", "%H:%M").time().replace(tzinfo=UTC))
 
     log.info(f"Bot started — monitoring {len(MATCHES)} matches.")
