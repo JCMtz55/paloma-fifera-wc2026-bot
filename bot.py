@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -67,6 +68,16 @@ KNOCKOUT_LABELS = {
 }
 
 GROUP_STAGE = set("ABCDEFGHIJKL")
+
+# ------------------------------------------------------------------ #
+#  Betting config                                                     #
+# ------------------------------------------------------------------ #
+
+STARTING_BALANCE = 500
+MIN_BET = 10
+BET_CUTOFF = timedelta(minutes=10)  # bets lock 10 min before kickoff
+
+OUTCOME_EMOJI = {"home": "🟢", "away": "🔴", "draw": "🤝"}
 
 
 # ------------------------------------------------------------------ #
@@ -208,6 +219,152 @@ def find_team(query: str) -> str | None:
 
 
 # ------------------------------------------------------------------ #
+#  Betting helpers (pure functions — unit tested)                     #
+# ------------------------------------------------------------------ #
+
+def make_match_key(match: dict) -> str:
+    """Deterministic key for a match: 'Home vs Away'."""
+    return f"{match['home']} vs {match['away']}"
+
+
+def resolve_outcome(match: dict, team: str, choice: str) -> str | None:
+    """Map a user's bet (team + 'win'/'draw') to 'home'/'away'/'draw'."""
+    if choice == "draw":
+        return "draw"
+    if choice == "win":
+        if match["home"] == team:
+            return "home"
+        if match["away"] == team:
+            return "away"
+    return None
+
+
+def result_to_outcome(match: dict, team: str, result_type: str) -> str | None:
+    """Map an admin /result (team + win/tie/loss) to the winning outcome."""
+    is_home = match["home"] == team
+    if result_type == "tie":
+        return "draw"
+    if result_type == "win":
+        return "home" if is_home else "away"
+    if result_type == "loss":
+        return "away" if is_home else "home"
+    return None
+
+
+def compute_odds(match_bets: dict) -> dict:
+    """Parimutuel odds from a match's bets ({user_id: {outcome, amount}})."""
+    pools = {"home": 0, "away": 0, "draw": 0}
+    counts = {"home": 0, "away": 0, "draw": 0}
+    for bet in match_bets.values():
+        pools[bet["outcome"]] += bet["amount"]
+        counts[bet["outcome"]] += 1
+    total = sum(pools.values())
+    result = {"total": total, "bettors": len(match_bets)}
+    for o in ("home", "away", "draw"):
+        wp = pools[o]
+        result[o] = {
+            "bets": counts[o],
+            "pool": wp,
+            "ratio": max(total / wp, 1.0) if wp > 0 else 0.0,
+        }
+    return result
+
+
+def settle_match(match_bets: dict, winning_outcome: str) -> tuple[list, bool]:
+    """Compute payouts for every bet on a match.
+
+    Returns (records, no_winners). Each record is a dict with user_id, amount,
+    outcome, won, payout. When nobody picked the winning outcome, every bettor
+    is refunded their stake (no_winners=True, all records won=False).
+    """
+    pools = {"home": 0, "away": 0, "draw": 0}
+    for bet in match_bets.values():
+        pools[bet["outcome"]] += bet["amount"]
+    total = sum(pools.values())
+    winning_pool = pools[winning_outcome]
+    no_winners = winning_pool == 0
+
+    records = []
+    for uid, bet in match_bets.items():
+        if no_winners:
+            payout, won = bet["amount"], False
+        elif bet["outcome"] == winning_outcome:
+            payout = max(math.floor(bet["amount"] * total / winning_pool), bet["amount"])
+            won = True
+        else:
+            payout, won = 0, False
+        records.append({
+            "user_id": uid,
+            "amount": bet["amount"],
+            "outcome": bet["outcome"],
+            "won": won,
+            "payout": payout,
+        })
+    return records, no_winners
+
+
+def outcome_team_label(match: dict, outcome: str) -> str:
+    """Human label for an outcome using real team names."""
+    if outcome == "home":
+        return match["home"]
+    if outcome == "away":
+        return match["away"]
+    return "Draw"
+
+
+# ------------------------------------------------------------------ #
+#  Betting helpers (context-bound)                                    #
+# ------------------------------------------------------------------ #
+
+def get_balance(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> int:
+    """Return the user's balance, lazily granting the starting balance."""
+    wallets: dict = context.bot_data.setdefault("wallets", {})
+    if user_id not in wallets:
+        wallets[user_id] = STARTING_BALANCE
+    return wallets[user_id]
+
+
+def next_match_for_team(team: str, context: ContextTypes.DEFAULT_TYPE, now: datetime) -> dict | None:
+    upcoming = sorted(
+        [m for m in all_matches(context)
+         if (m["home"] == team or m["away"] == team) and m["kickoff"] > now],
+        key=lambda m: m["kickoff"],
+    )
+    return upcoming[0] if upcoming else None
+
+
+def match_to_settle_for_team(team: str, context: ContextTypes.DEFAULT_TYPE, now: datetime) -> dict | None:
+    """Most recently kicked-off, not-yet-settled match for a team."""
+    settled: set = context.bot_data.get("settled_matches", set())
+    past = sorted(
+        [m for m in all_matches(context)
+         if (m["home"] == team or m["away"] == team)
+         and m["kickoff"] < now
+         and make_match_key(m) not in settled],
+        key=lambda m: m["kickoff"],
+        reverse=True,
+    )
+    return past[0] if past else None
+
+
+def fmt_odds_inline(match: dict, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """One-line odds summary for the 1-hour alert."""
+    match_bets = context.bot_data.get("bets", {}).get(make_match_key(match), {})
+    odds = compute_odds(match_bets)
+    parts = []
+    for o in ("home", "draw", "away"):
+        label = outcome_team_label(match, o)
+        ratio = odds[o]["ratio"]
+        ratio_str = f"{ratio:.1f}x" if ratio > 0 else "—"
+        parts.append(f"{OUTCOME_EMOJI[o]} {label} {ratio_str}")
+    return (
+        "\n\n💰 *Betting open — closes in 50 minutes!*\n"
+        f"Current odds: {'  '.join(parts)}\n"
+        f"Place your bet: `/bet {match['home']} win 50`"
+    )
+
+
+# ------------------------------------------------------------------ #
 #  Scheduled job — 1-hour alerts                                      #
 # ------------------------------------------------------------------ #
 
@@ -254,6 +411,8 @@ async def check_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
                             name = user_names.get(uid, "Fan")
                             mentions.append(f"[{name}](tg://user?id={uid})")
                         text = fmt_alert(match, mentions or None)
+
+                    text += fmt_odds_inline(match, context)
 
                     await context.bot.send_message(
                         chat_id=CHAT_ID,
@@ -629,6 +788,78 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         parse_mode="Markdown",
     )
 
+    await settle_bets(context, team, result_type)
+
+
+async def settle_bets(context: ContextTypes.DEFAULT_TYPE, team: str, result_type: str) -> None:
+    """Settle any open bets on the team's most recent match and announce payouts."""
+    now = datetime.now(tz=UTC)
+    match = match_to_settle_for_team(team, context, now)
+    if not match:
+        return
+
+    key = make_match_key(match)
+    bets: dict = context.bot_data.setdefault("bets", {})
+    settled: set = context.bot_data.setdefault("settled_matches", set())
+    match_bets = bets.get(key, {})
+
+    # Mark settled regardless, so /result can't double-settle the same match.
+    settled.add(key)
+
+    if not match_bets:
+        return
+
+    winning_outcome = result_to_outcome(match, team, result_type)
+    if winning_outcome is None:
+        return
+
+    records, no_winners = settle_match(match_bets, winning_outcome)
+
+    wallets: dict = context.bot_data.setdefault("wallets", {})
+    history: list = context.bot_data.setdefault("bet_history", [])
+    user_names: dict = context.bot_data.get("user_names", {})
+    odds = compute_odds(match_bets)
+    ratio = odds[winning_outcome]["ratio"]
+
+    winner_lines = []
+    for rec in records:
+        if rec["payout"] > 0:
+            wallets[rec["user_id"]] = wallets.get(rec["user_id"], STARTING_BALANCE) + rec["payout"]
+        history.append({
+            "match_key": key,
+            "user_id": rec["user_id"],
+            "outcome": rec["outcome"],
+            "amount": rec["amount"],
+            "won": rec["won"],
+            "payout": rec["payout"],
+            "settled_at": now.isoformat(),
+        })
+        if rec["won"]:
+            name = user_names.get(rec["user_id"], f"User{rec['user_id'][-4:]}")
+            gain = rec["payout"] - rec["amount"]
+            winner_lines.append(
+                f"  🎉 {name} +{gain:,} 🪙  (was {rec['amount']:,} 🪙 @ {ratio:.1f}x) "
+                f"→ {wallets[rec['user_id']]:,} 🪙 total"
+            )
+
+    # Remove the settled match's bets
+    del bets[key]
+
+    win_label = outcome_team_label(match, winning_outcome)
+    text = (
+        f"💰 *Bet Results — {match['home']} vs {match['away']}*\n\n"
+        f"Winning outcome: {OUTCOME_EMOJI[winning_outcome]} {win_label}\n"
+    )
+    if no_winners:
+        text += "\nNo winning bets — pool returned to bettors."
+    else:
+        text += "\n*Winners:*\n" + "\n".join(winner_lines)
+
+    try:
+        await context.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
+    except TelegramError as e:
+        log.error(f"Failed to send settlement announcement: {e}")
+
 
 
 async def cmd_syncnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -726,6 +957,282 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
+# ------------------------------------------------------------------ #
+#  Betting commands                                                    #
+# ------------------------------------------------------------------ #
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user_name(context, update.effective_user)
+    user_id = str(update.effective_user.id)
+    wallets: dict = context.bot_data.setdefault("wallets", {})
+    first_time = user_id not in wallets
+    balance = get_balance(context, user_id)
+
+    if first_time:
+        await update.message.reply_text(
+            f"👋 Welcome! You've been granted *{STARTING_BALANCE:,} 🪙* to start betting.\n\n"
+            f"Use /bet Mexico win 50 to place your first bet, or /odds Mexico to see the lines.",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"🪙 Your balance: *{balance:,} coins*", parse_mode="Markdown"
+        )
+
+
+async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user_name(context, update.effective_user)
+    now = datetime.now(tz=UTC)
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Usage: /bet <team> <win|draw> <amount>\nExample: /bet Mexico win 50"
+        )
+        return
+
+    choice = context.args[-2].lower()
+    amount_raw = context.args[-1]
+    team_query = " ".join(context.args[:-2])
+
+    if choice not in ("win", "draw"):
+        await update.message.reply_text("❌ Outcome must be `win` or `draw`.\nExample: /bet Mexico win 50", parse_mode="Markdown")
+        return
+
+    try:
+        amount = int(amount_raw)
+    except ValueError:
+        await update.message.reply_text("❌ Amount must be a whole number.\nExample: /bet Mexico win 50")
+        return
+
+    if amount < MIN_BET:
+        await update.message.reply_text(f"❌ Minimum bet is {MIN_BET} coins.")
+        return
+
+    team = find_team(team_query)
+    if not team:
+        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+        return
+
+    match = next_match_for_team(team, context, now)
+    if not match or now >= match["kickoff"] - BET_CUTOFF:
+        await update.message.reply_text("❌ Bets for this match are closed.")
+        return
+
+    outcome = resolve_outcome(match, team, choice)
+    if outcome is None:
+        await update.message.reply_text("❌ Couldn't read that bet. Example: /bet Mexico win 50")
+        return
+
+    user_id = str(update.effective_user.id)
+    balance = get_balance(context, user_id)
+    key = make_match_key(match)
+    bets: dict = context.bot_data.setdefault("bets", {})
+    match_bets: dict = bets.setdefault(key, {})
+
+    # Replacing an existing bet: refund the old stake first.
+    replaced = None
+    if user_id in match_bets:
+        replaced = match_bets[user_id]
+        balance += replaced["amount"]
+
+    if amount > balance:
+        await update.message.reply_text(f"❌ Not enough coins. Your balance: {balance:,} 🪙")
+        return
+
+    context.bot_data["wallets"][user_id] = balance - amount
+    match_bets[user_id] = {"outcome": outcome, "amount": amount}
+
+    pick = "Draw" if outcome == "draw" else f"{outcome_team_label(match, outcome)} to win"
+    lines = []
+    if replaced:
+        old_pick = "Draw" if replaced["outcome"] == "draw" else f"{outcome_team_label(match, replaced['outcome'])} to win"
+        lines.append(
+            f"⚠️ You already bet on this match. Your previous bet of "
+            f"{replaced['amount']:,} 🪙 on {old_pick} has been replaced.\n"
+        )
+    lines.append(
+        f"✅ *Bet placed!*\n"
+        f"{match['home']} vs {match['away']}  —  {group_label(match.get('group', ''))}\n"
+        f"Your pick: {OUTCOME_EMOJI[outcome]} {pick}\n"
+        f"Amount: {amount:,} 🪙\n"
+        f"Balance: {context.bot_data['wallets'][user_id]:,} 🪙"
+    )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    now = datetime.now(tz=UTC)
+    if not context.args:
+        await update.message.reply_text("Usage: /odds Mexico")
+        return
+
+    team = find_team(" ".join(context.args))
+    if not team:
+        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+        return
+
+    match = next_match_for_team(team, context, now)
+    if not match:
+        await update.message.reply_text(f"No upcoming match found for {team}.")
+        return
+
+    key = make_match_key(match)
+    match_bets = context.bot_data.get("bets", {}).get(key, {})
+    odds = compute_odds(match_bets)
+
+    closed = now >= match["kickoff"] - BET_CUTOFF
+    if closed:
+        status = "🔒 Betting closed"
+    else:
+        time_left = match["kickoff"] - BET_CUTOFF - now
+        mins = int(time_left.total_seconds() // 60)
+        hrs, m = divmod(mins, 60)
+        status = f"Closes in {hrs}h {m}m" if hrs else f"Closes in {m}m"
+
+    header = (
+        f"📊 *Live Odds — {match['home']} vs {match['away']}*\n"
+        f"{group_label(match.get('group', ''))}  •  {status}"
+    )
+
+    if odds["total"] == 0:
+        await update.message.reply_text(
+            f"{header}\n\nNo bets placed yet — be the first!", parse_mode="Markdown"
+        )
+        return
+
+    rows = []
+    for o in ("home", "draw", "away"):
+        label = outcome_team_label(match, o)
+        ratio = odds[o]["ratio"]
+        ratio_str = f"{ratio:.1f}x" if ratio > 0 else "—"
+        rows.append(
+            f"{OUTCOME_EMOJI[o]} {label} — {odds[o]['bets']} bets · "
+            f"{odds[o]['pool']:,} 🪙 · {ratio_str}"
+        )
+
+    await update.message.reply_text(
+        f"{header}\n\n" + "\n".join(rows) +
+        f"\n\nTotal pool: {odds['total']:,} 🪙 | {odds['bettors']} bettors",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user_name(context, update.effective_user)
+    user_id = str(update.effective_user.id)
+    bets: dict = context.bot_data.get("bets", {})
+
+    # Map match_key → match dict for the open bets
+    matches_by_key = {make_match_key(m): m for m in all_matches(context)}
+
+    user_bets = []
+    for key, match_bets in bets.items():
+        if user_id in match_bets and key in matches_by_key:
+            user_bets.append((matches_by_key[key], match_bets))
+
+    if not user_bets:
+        await update.message.reply_text(
+            "You have no open bets. Use /bet Mexico win 50 to place one."
+        )
+        return
+
+    user_bets.sort(key=lambda mb: mb[0]["kickoff"])
+    lines = ["📋 *Your open bets:*\n"]
+    for i, (match, match_bets) in enumerate(user_bets, 1):
+        bet = match_bets[user_id]
+        odds = compute_odds(match_bets)
+        ratio = odds[bet["outcome"]]["ratio"]
+        est = math.floor(bet["amount"] * ratio) if ratio > 0 else bet["amount"]
+        pick = "Draw" if bet["outcome"] == "draw" else outcome_team_label(match, bet["outcome"])
+        day = match["kickoff"].astimezone(LOCAL_TZ).strftime("%b %d")
+        lines.append(
+            f"{i}. *{match['home']} vs {match['away']}*  ({group_label(match.get('group', ''))}, {day})\n"
+            f"   Pick: {OUTCOME_EMOJI[bet['outcome']]} {pick}  •  {bet['amount']:,} 🪙  •  "
+            f"odds {ratio:.1f}x → est. {est:,} 🪙"
+        )
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_betleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user_name(context, update.effective_user)
+    wallets: dict = context.bot_data.get("wallets", {})
+    user_names: dict = context.bot_data.get("user_names", {})
+    history: list = context.bot_data.get("bet_history", [])
+
+    if not wallets:
+        await update.message.reply_text("No bets placed yet. Use /bet to join in.")
+        return
+
+    # Tally wins / total settled bets per user
+    wins: dict = {}
+    totals: dict = {}
+    for rec in history:
+        uid = rec["user_id"]
+        totals[uid] = totals.get(uid, 0) + 1
+        if rec["won"]:
+            wins[uid] = wins.get(uid, 0) + 1
+
+    scores = sorted(
+        wallets.items(), key=lambda kv: kv[1], reverse=True
+    )
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = ["🪙 *Betting Leaderboard:*\n"]
+    for i, (uid, balance) in enumerate(scores):
+        rank = medals[i] if i < 3 else f"{i + 1}\\."
+        name = user_names.get(uid, f"User{uid[-4:]}")
+        w = wins.get(uid, 0)
+        t = totals.get(uid, 0)
+        bet_word = "bet" if t == 1 else "bets"
+        win_word = "win" if w == 1 else "wins"
+        lines.append(f"{rank} *{name}* — {balance:,} 🪙  ({w} {win_word} / {t} {bet_word})")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ You don't have permission to use this command.")
+        return
+
+    now = datetime.now(tz=UTC)
+    if not context.args:
+        await update.message.reply_text("Usage: /cancelbet Mexico")
+        return
+
+    team = find_team(" ".join(context.args))
+    if not team:
+        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+        return
+
+    match = next_match_for_team(team, context, now)
+    if not match:
+        await update.message.reply_text(f"No upcoming match found for {team}.")
+        return
+
+    key = make_match_key(match)
+    bets: dict = context.bot_data.setdefault("bets", {})
+    match_bets = bets.get(key, {})
+
+    if not match_bets:
+        await update.message.reply_text(f"No bets to refund on {key}.")
+        return
+
+    wallets: dict = context.bot_data.setdefault("wallets", {})
+    total_refunded = 0
+    for uid, bet in match_bets.items():
+        wallets[uid] = wallets.get(uid, STARTING_BALANCE) + bet["amount"]
+        total_refunded += bet["amount"]
+    count = len(match_bets)
+    del bets[key]
+
+    await update.message.reply_text(
+        f"✅ All bets on {key} have been refunded.\n"
+        f"{count} {'bet' if count == 1 else 'bets'} · {total_refunded:,} 🪙 returned to bettors.",
+    )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "⚽ *World Cup 2026 Bot*\n\n"
@@ -745,7 +1252,13 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/myteams — Your teams and their next matches\n"
         "/result Mexico win 3 — Log a match result (win/tie/loss + goals)\n"
         "/leaderboard — Show standings with points and goals\n"
-        "/help — Show this message"
+        "/help — Show this message\n\n"
+        "*Betting (fake coins 🪙):*\n"
+        "/balance — Check your coin balance\n"
+        "/bet Mexico win 50 — Bet 50 coins on Mexico to win (or `draw`)\n"
+        "/odds Mexico — Live pool odds for Mexico's next match\n"
+        "/mybets — Your open bets\n"
+        "/betleaderboard — Betting standings"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -774,6 +1287,12 @@ def main() -> None:
     app.add_handler(CommandHandler("result", cmd_result))
     app.add_handler(CommandHandler("adjust", cmd_adjust))
     app.add_handler(CommandHandler("leaderboard", cmd_leaderboard))
+    app.add_handler(CommandHandler("balance", cmd_balance))
+    app.add_handler(CommandHandler("bet", cmd_bet))
+    app.add_handler(CommandHandler("odds", cmd_odds))
+    app.add_handler(CommandHandler("mybets", cmd_mybets))
+    app.add_handler(CommandHandler("betleaderboard", cmd_betleaderboard))
+    app.add_handler(CommandHandler("cancelbet", cmd_cancelbet))
     app.add_handler(CommandHandler("help", cmd_help))
 
     app.job_queue.run_repeating(check_schedule, interval=60, first=10)
