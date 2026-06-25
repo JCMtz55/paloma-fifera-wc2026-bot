@@ -17,6 +17,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+# Auto-delete the bot's command replies after this many minutes (0 = never).
+AUTO_DELETE_MINUTES = int(os.getenv("AUTO_DELETE_MINUTES", "5"))
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
 FOOTBALL_API_URL = "https://api.football-data.org/v4/competitions/WC/matches"
 
@@ -477,6 +479,30 @@ async def sync_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ------------------------------------------------------------------ #
+#  Ephemeral replies                                                   #
+# ------------------------------------------------------------------ #
+
+async def _delete_message_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id, message_id = context.job.data
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except TelegramError:
+        pass  # already deleted, or older than Telegram's 48h delete window
+
+
+async def reply_ephemeral(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
+    """Reply to a command and auto-delete the reply after AUTO_DELETE_MINUTES."""
+    msg = await update.message.reply_text(text, **kwargs)
+    if AUTO_DELETE_MINUTES > 0:
+        context.job_queue.run_once(
+            _delete_message_job,
+            when=timedelta(minutes=AUTO_DELETE_MINUTES),
+            data=(msg.chat_id, msg.message_id),
+        )
+    return msg
+
+
+# ------------------------------------------------------------------ #
 #  Commands                                                            #
 # ------------------------------------------------------------------ #
 
@@ -486,12 +512,12 @@ async def cmd_upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     matches = future_matches(now, context)[:3]
 
     if not matches:
-        await update.message.reply_text("No upcoming matches found.")
+        await reply_ephemeral(update, context, "No upcoming matches found.")
         return
 
     lines = ["📅 *Next 3 matches:*\n"]
     lines += [fmt_match(m, now) for m in matches]
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -499,10 +525,10 @@ async def cmd_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     matches = future_matches(now, context)
 
     if not matches:
-        await update.message.reply_text("No upcoming matches found.")
+        await reply_ephemeral(update, context, "No upcoming matches found.")
         return
 
-    await update.message.reply_text(fmt_match(matches[0], now), parse_mode="Markdown")
+    await reply_ephemeral(update, context, fmt_match(matches[0], now), parse_mode="Markdown")
 
 
 async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -513,7 +539,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     matches.sort(key=lambda m: m["kickoff"])
 
     if not matches:
-        await update.message.reply_text("No matches today.")
+        await reply_ephemeral(update, context, "No matches today.")
         return
 
     lines = [f"📅 *Matches today ({today_local.strftime('%b %d')}):*\n"]
@@ -523,7 +549,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🏆 {group_label(m.get('group', ''))}  •  📍 {m.get('venue', '')}\n"
             f"🕐 {fmt_time(m['kickoff'])}"
         )
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -534,7 +560,7 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     matches.sort(key=lambda m: m["kickoff"])
 
     if not matches:
-        await update.message.reply_text("No matches tomorrow.")
+        await reply_ephemeral(update, context, "No matches tomorrow.")
         return
 
     lines = [f"📅 *Matches tomorrow ({tomorrow_local.strftime('%b %d')}):*\n"]
@@ -544,7 +570,7 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"🏆 {group_label(m.get('group', ''))}  •  📍 {m.get('venue', '')}\n"
             f"🕐 {fmt_time(m['kickoff'])}"
         )
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -559,7 +585,7 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     matches.sort(key=lambda m: m["kickoff"])
 
     if not matches:
-        await update.message.reply_text("No matches in the next 7 days.")
+        await reply_ephemeral(update, context, "No matches in the next 7 days.")
         return
 
     # Group by local date for readability
@@ -579,14 +605,14 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             label = group_label(m.get("group", ""))
             lines.append(f"`{time_str} {tz_abbr}`  {m['home']} vs {m['away']}  ·  _{label}_")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(tz=UTC)
 
     if not context.args:
-        await update.message.reply_text("Usage: /group A")
+        await reply_ephemeral(update, context, "Usage: /group A")
         return
 
     letter = context.args[0].upper()
@@ -594,7 +620,7 @@ async def cmd_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     matches.sort(key=lambda m: m["kickoff"])
 
     if not matches:
-        await update.message.reply_text(f"No matches found for Group {letter}.")
+        await reply_ephemeral(update, context, f"No matches found for Group {letter}.")
         return
 
     lines = [f"📅 *Group {letter} schedule:*\n"]
@@ -604,14 +630,14 @@ async def cmd_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"🆚 *{m['home']} vs {m['away']}*  (MD{m.get('matchday', '?')})\n"
             f"📍 {m.get('venue', '')}  •  {status} {fmt_time(m['kickoff'])}"
         )
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(tz=UTC)
 
     if not context.args:
-        await update.message.reply_text("Usage: /schedule Mexico")
+        await reply_ephemeral(update, context, "Usage: /schedule Mexico")
         return
 
     team = " ".join(context.args).lower()
@@ -622,7 +648,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     matches.sort(key=lambda m: m["kickoff"])
 
     if not matches:
-        await update.message.reply_text(f"No matches found for \"{' '.join(context.args)}\".")
+        await reply_ephemeral(update, context, f"No matches found for \"{' '.join(context.args)}\".")
         return
 
     team_display = matches[0]["home"] if team in matches[0]["home"].lower() else matches[0]["away"]
@@ -635,7 +661,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"{status} *{side} {opponent}*  —  {group_label(m.get('group', ''))} MD{m.get('matchday', '?')}\n"
             f"📍 {m.get('venue', '')}  •  🕐 {fmt_time(m['kickoff'])}"
         )
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_teams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -654,17 +680,17 @@ async def cmd_teams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(f"*Group {g}:* {' • '.join(teams)}")
 
     lines.append("\nUse /register followed by the team name to add it to your list.")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /register Mexico")
+        await reply_ephemeral(update, context, "Usage: /register Mexico")
         return
 
     team = find_team(" ".join(context.args))
     if not team:
-        await update.message.reply_text(f"❌ Team not found. Check the spelling and try again.")
+        await reply_ephemeral(update, context, f"❌ Team not found. Check the spelling and try again.")
         return
 
     user_id = str(update.effective_user.id)
@@ -672,7 +698,7 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_teams: list = registrations.setdefault(user_id, [])
 
     if team in user_teams:
-        await update.message.reply_text(f"You already have *{team}* registered.", parse_mode="Markdown")
+        await reply_ephemeral(update, context, f"You already have *{team}* registered.", parse_mode="Markdown")
         return
 
     user_teams.append(team)
@@ -681,12 +707,12 @@ async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_names: dict = context.bot_data.setdefault("user_names", {})
     user_names[user_id] = update.effective_user.first_name or f"User{user_id[-4:]}"
 
-    await update.message.reply_text(f"✅ *{team}* added to your teams.", parse_mode="Markdown")
+    await reply_ephemeral(update, context, f"✅ *{team}* added to your teams.", parse_mode="Markdown")
 
 
 async def cmd_unregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /unregister Mexico")
+        await reply_ephemeral(update, context, "Usage: /unregister Mexico")
         return
 
     team = find_team(" ".join(context.args))
@@ -695,11 +721,11 @@ async def cmd_unregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_teams: list = registrations.get(user_id, [])
 
     if not team or team not in user_teams:
-        await update.message.reply_text(f"❌ That team isn't in your list.")
+        await reply_ephemeral(update, context, f"❌ That team isn't in your list.")
         return
 
     user_teams.remove(team)
-    await update.message.reply_text(f"✅ *{team}* removed from your teams.", parse_mode="Markdown")
+    await reply_ephemeral(update, context, f"✅ *{team}* removed from your teams.", parse_mode="Markdown")
 
 
 async def cmd_myteams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -710,7 +736,7 @@ async def cmd_myteams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user_teams: list = registrations.get(user_id, [])
 
     if not user_teams:
-        await update.message.reply_text(
+        await reply_ephemeral(update, context, 
             "You have no teams registered. Use /register Mexico to add one."
         )
         return
@@ -739,16 +765,16 @@ async def cmd_myteams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             lines.append(f"🏳 *{team}*\nNo upcoming matches.")
 
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ You don't have permission to use this command.")
+        await reply_ephemeral(update, context, "❌ You don't have permission to use this command.")
         return
 
     if len(context.args) < 3:
-        await update.message.reply_text("Usage: /result Mexico win 3\nResult must be: win, tie, or loss")
+        await reply_ephemeral(update, context, "Usage: /result Mexico win 3\nResult must be: win, tie, or loss")
         return
 
     # Find where the result keyword is — everything before it is the team name
@@ -757,7 +783,7 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         (i for i, a in enumerate(context.args) if a.lower() in result_keywords), None
     )
     if split_index is None or split_index == 0:
-        await update.message.reply_text("❌ Result must be: win, tie, or loss\nUsage: /result South Korea win 3")
+        await reply_ephemeral(update, context, "❌ Result must be: win, tie, or loss\nUsage: /result South Korea win 3")
         return
 
     team_query = " ".join(context.args[:split_index])
@@ -766,12 +792,12 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         goals = int(context.args[split_index + 1])
     except (IndexError, ValueError):
-        await update.message.reply_text("❌ Goals must be a number.\nUsage: /result South Korea win 3")
+        await reply_ephemeral(update, context, "❌ Goals must be a number.\nUsage: /result South Korea win 3")
         return
 
     team = find_team(team_query)
     if not team:
-        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+        await reply_ephemeral(update, context, "❌ Team not found. Use /teams to see all team names.")
         return
 
     points = {"win": 2, "tie": 1, "loss": 0}[result_type]
@@ -783,7 +809,7 @@ async def cmd_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     team_results[team]["goals"] += goals
 
     result_emoji = {"win": "✅", "tie": "🤝", "loss": "❌"}[result_type]
-    await update.message.reply_text(
+    await reply_ephemeral(update, context, 
         f"{result_emoji} *{team}* — {result_type} | {goals} goals | +{points} pts",
         parse_mode="Markdown",
     )
@@ -864,21 +890,21 @@ async def settle_bets(context: ContextTypes.DEFAULT_TYPE, team: str, result_type
 
 async def cmd_syncnow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ You don't have permission to use this command.")
+        await reply_ephemeral(update, context, "❌ You don't have permission to use this command.")
         return
-    await update.message.reply_text("🔄 Fetching schedule from API...")
+    await reply_ephemeral(update, context, "🔄 Fetching schedule from API...")
     await sync_schedule(context)
     count = len(context.bot_data.get("matches", []))
-    await update.message.reply_text(f"✅ Done — {count} matches loaded.")
+    await reply_ephemeral(update, context, f"✅ Done — {count} matches loaded.")
 
 
 async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ You don't have permission to use this command.")
+        await reply_ephemeral(update, context, "❌ You don't have permission to use this command.")
         return
 
     if len(context.args) < 3:
-        await update.message.reply_text(
+        await reply_ephemeral(update, context, 
             "Usage: /adjust Mexico -2 -3\n"
             "First number = points delta, second = goals delta\n"
             "Use negative numbers to subtract."
@@ -890,20 +916,20 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         (i for i, a in enumerate(context.args) if a.lstrip("+-").isdigit()), None
     )
     if split_index is None or split_index == 0:
-        await update.message.reply_text("❌ Could not parse command. Usage: /adjust Mexico -2 -3")
+        await reply_ephemeral(update, context, "❌ Could not parse command. Usage: /adjust Mexico -2 -3")
         return
 
     team_query = " ".join(context.args[:split_index])
     team = find_team(team_query)
     if not team:
-        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+        await reply_ephemeral(update, context, "❌ Team not found. Use /teams to see all team names.")
         return
 
     try:
         points_delta = int(context.args[split_index])
         goals_delta = int(context.args[split_index + 1])
     except (IndexError, ValueError):
-        await update.message.reply_text("❌ Points and goals must be numbers. Usage: /adjust Mexico -2 -3")
+        await reply_ephemeral(update, context, "❌ Points and goals must be numbers. Usage: /adjust Mexico -2 -3")
         return
 
     team_results: dict = context.bot_data.setdefault("team_results", {})
@@ -915,7 +941,7 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     p = team_results[team]["points"]
     g = team_results[team]["goals"]
-    await update.message.reply_text(
+    await reply_ephemeral(update, context, 
         f"✅ *{team}* adjusted.\n"
         f"Points: {'+' if points_delta >= 0 else ''}{points_delta} → *{p} pts total*\n"
         f"Goals: {'+' if goals_delta >= 0 else ''}{goals_delta} → *{g} goals total*",
@@ -930,7 +956,7 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     team_results: dict = context.bot_data.get("team_results", {})
 
     if not registrations:
-        await update.message.reply_text("No users registered yet. Use /register to join.")
+        await reply_ephemeral(update, context, "No users registered yet. Use /register to join.")
         return
 
     scores = []
@@ -954,7 +980,7 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"   {teams_str}"
         )
 
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n\n".join(lines), parse_mode="Markdown")
 
 
 # ------------------------------------------------------------------ #
@@ -969,13 +995,13 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     balance = get_balance(context, user_id)
 
     if first_time:
-        await update.message.reply_text(
+        await reply_ephemeral(update, context, 
             f"👋 Welcome! You've been granted *{STARTING_BALANCE:,} 🪙* to start betting.\n\n"
             f"Use /bet Mexico win 50 to place your first bet, or /odds Mexico to see the lines.",
             parse_mode="Markdown",
         )
     else:
-        await update.message.reply_text(
+        await reply_ephemeral(update, context, 
             f"🪙 Your balance: *{balance:,} coins*", parse_mode="Markdown"
         )
 
@@ -985,7 +1011,7 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(tz=UTC)
 
     if len(context.args) < 3:
-        await update.message.reply_text(
+        await reply_ephemeral(update, context, 
             "Usage: /bet <team> <win|draw> <amount>\nExample: /bet Mexico win 50"
         )
         return
@@ -995,32 +1021,32 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     team_query = " ".join(context.args[:-2])
 
     if choice not in ("win", "draw"):
-        await update.message.reply_text("❌ Outcome must be `win` or `draw`.\nExample: /bet Mexico win 50", parse_mode="Markdown")
+        await reply_ephemeral(update, context, "❌ Outcome must be `win` or `draw`.\nExample: /bet Mexico win 50", parse_mode="Markdown")
         return
 
     try:
         amount = int(amount_raw)
     except ValueError:
-        await update.message.reply_text("❌ Amount must be a whole number.\nExample: /bet Mexico win 50")
+        await reply_ephemeral(update, context, "❌ Amount must be a whole number.\nExample: /bet Mexico win 50")
         return
 
     if amount < MIN_BET:
-        await update.message.reply_text(f"❌ Minimum bet is {MIN_BET} coins.")
+        await reply_ephemeral(update, context, f"❌ Minimum bet is {MIN_BET} coins.")
         return
 
     team = find_team(team_query)
     if not team:
-        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+        await reply_ephemeral(update, context, "❌ Team not found. Use /teams to see all team names.")
         return
 
     match = next_match_for_team(team, context, now)
     if not match or now >= match["kickoff"] - BET_CUTOFF:
-        await update.message.reply_text("❌ Bets for this match are closed.")
+        await reply_ephemeral(update, context, "❌ Bets for this match are closed.")
         return
 
     outcome = resolve_outcome(match, team, choice)
     if outcome is None:
-        await update.message.reply_text("❌ Couldn't read that bet. Example: /bet Mexico win 50")
+        await reply_ephemeral(update, context, "❌ Couldn't read that bet. Example: /bet Mexico win 50")
         return
 
     user_id = str(update.effective_user.id)
@@ -1036,7 +1062,7 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         balance += replaced["amount"]
 
     if amount > balance:
-        await update.message.reply_text(f"❌ Not enough coins. Your balance: {balance:,} 🪙")
+        await reply_ephemeral(update, context, f"❌ Not enough coins. Your balance: {balance:,} 🪙")
         return
 
     context.bot_data["wallets"][user_id] = balance - amount
@@ -1057,23 +1083,23 @@ async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Amount: {amount:,} 🪙\n"
         f"Balance: {context.bot_data['wallets'][user_id]:,} 🪙"
     )
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(tz=UTC)
     if not context.args:
-        await update.message.reply_text("Usage: /odds Mexico")
+        await reply_ephemeral(update, context, "Usage: /odds Mexico")
         return
 
     team = find_team(" ".join(context.args))
     if not team:
-        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+        await reply_ephemeral(update, context, "❌ Team not found. Use /teams to see all team names.")
         return
 
     match = next_match_for_team(team, context, now)
     if not match:
-        await update.message.reply_text(f"No upcoming match found for {team}.")
+        await reply_ephemeral(update, context, f"No upcoming match found for {team}.")
         return
 
     key = make_match_key(match)
@@ -1095,7 +1121,7 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     if odds["total"] == 0:
-        await update.message.reply_text(
+        await reply_ephemeral(update, context, 
             f"{header}\n\nNo bets placed yet — be the first!", parse_mode="Markdown"
         )
         return
@@ -1110,7 +1136,7 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{odds[o]['pool']:,} 🪙 · {ratio_str}"
         )
 
-    await update.message.reply_text(
+    await reply_ephemeral(update, context, 
         f"{header}\n\n" + "\n".join(rows) +
         f"\n\nTotal pool: {odds['total']:,} 🪙 | {odds['bettors']} bettors",
         parse_mode="Markdown",
@@ -1131,7 +1157,7 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             user_bets.append((matches_by_key[key], match_bets))
 
     if not user_bets:
-        await update.message.reply_text(
+        await reply_ephemeral(update, context, 
             "You have no open bets. Use /bet Mexico win 50 to place one."
         )
         return
@@ -1151,7 +1177,7 @@ async def cmd_mybets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"odds {ratio:.1f}x → est. {est:,} 🪙"
         )
 
-    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_betleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1161,7 +1187,7 @@ async def cmd_betleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE)
     history: list = context.bot_data.get("bet_history", [])
 
     if not wallets:
-        await update.message.reply_text("No bets placed yet. Use /bet to join in.")
+        await reply_ephemeral(update, context, "No bets placed yet. Use /bet to join in.")
         return
 
     # Tally wins / total settled bets per user
@@ -1188,27 +1214,27 @@ async def cmd_betleaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE)
         win_word = "win" if w == 1 else "wins"
         lines.append(f"{rank} *{name}* — {balance:,} 🪙  ({w} {win_word} / {t} {bet_word})")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await reply_ephemeral(update, context, "\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ You don't have permission to use this command.")
+        await reply_ephemeral(update, context, "❌ You don't have permission to use this command.")
         return
 
     now = datetime.now(tz=UTC)
     if not context.args:
-        await update.message.reply_text("Usage: /cancelbet Mexico")
+        await reply_ephemeral(update, context, "Usage: /cancelbet Mexico")
         return
 
     team = find_team(" ".join(context.args))
     if not team:
-        await update.message.reply_text("❌ Team not found. Use /teams to see all team names.")
+        await reply_ephemeral(update, context, "❌ Team not found. Use /teams to see all team names.")
         return
 
     match = next_match_for_team(team, context, now)
     if not match:
-        await update.message.reply_text(f"No upcoming match found for {team}.")
+        await reply_ephemeral(update, context, f"No upcoming match found for {team}.")
         return
 
     key = make_match_key(match)
@@ -1216,7 +1242,7 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     match_bets = bets.get(key, {})
 
     if not match_bets:
-        await update.message.reply_text(f"No bets to refund on {key}.")
+        await reply_ephemeral(update, context, f"No bets to refund on {key}.")
         return
 
     wallets: dict = context.bot_data.setdefault("wallets", {})
@@ -1227,7 +1253,7 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     count = len(match_bets)
     del bets[key]
 
-    await update.message.reply_text(
+    await reply_ephemeral(update, context, 
         f"✅ All bets on {key} have been refunded.\n"
         f"{count} {'bet' if count == 1 else 'bets'} · {total_refunded:,} 🪙 returned to bettors.",
     )
@@ -1260,7 +1286,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/mybets — Your open bets\n"
         "/betleaderboard — Betting standings"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await reply_ephemeral(update, context, text, parse_mode="Markdown")
 
 
 # ------------------------------------------------------------------ #
