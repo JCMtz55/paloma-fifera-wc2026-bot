@@ -147,7 +147,9 @@ def future_matches(now: datetime, context: ContextTypes.DEFAULT_TYPE) -> list:
     return sorted([m for m in all_matches(context) if m["kickoff"] > now], key=lambda m: m["kickoff"])
 
 
-def normalize_name(name: str) -> str:
+def normalize_name(name: str | None) -> str:
+    if not name:
+        return "TBD"
     return API_NAME_MAP.get(name.lower().strip(), name)
 
 
@@ -168,8 +170,8 @@ def is_duplicate(mapped: dict, existing: list) -> bool:
 
 
 def map_api_match(api_match: dict) -> dict | None:
-    home = normalize_name(api_match.get("homeTeam", {}).get("name", "TBD"))
-    away = normalize_name(api_match.get("awayTeam", {}).get("name", "TBD"))
+    home = normalize_name((api_match.get("homeTeam") or {}).get("name"))
+    away = normalize_name((api_match.get("awayTeam") or {}).get("name"))
     utc_date = api_match.get("utcDate", "")
     if not utc_date or home == "TBD" or away == "TBD":
         return None
@@ -384,6 +386,40 @@ async def cmd_tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"🕐 {fmt_time(m['kickoff'])}"
         )
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user_name(context, update.effective_user)
+    now = datetime.now(tz=UTC)
+    week_end = now + timedelta(days=7)
+
+    matches = [
+        m for m in all_matches(context)
+        if now < m["kickoff"] <= week_end
+    ]
+    matches.sort(key=lambda m: m["kickoff"])
+
+    if not matches:
+        await update.message.reply_text("No matches in the next 7 days.")
+        return
+
+    # Group by local date for readability
+    from collections import defaultdict
+    by_day = defaultdict(list)
+    for m in matches:
+        day = m["kickoff"].astimezone(LOCAL_TZ).strftime("%A, %b %d")
+        by_day[day].append(m)
+
+    lines = [f"📅 *Matches this week:*\n"]
+    for day, day_matches in by_day.items():
+        lines.append(f"*{day}*")
+        for m in day_matches:
+            lines.append(
+                f"🆚 {m['home']} vs {m['away']}  —  {group_label(m.get('group', ''))}\n"
+                f"🕐 {fmt_time(m['kickoff'])}"
+            )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -696,6 +732,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "All times are shown in PT.\n\n"
         "*Commands:*\n"
         "/upcoming — Next 3 upcoming matches\n"
+        "/week — All matches in the next 7 days\n"
         "/next — The very next match\n"
         "/today — All matches today\n"
         "/tomorrow — All matches tomorrow\n"
@@ -722,6 +759,7 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
 
     app.add_handler(CommandHandler("upcoming", cmd_upcoming))
+    app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("next", cmd_next))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("tomorrow", cmd_tomorrow))
