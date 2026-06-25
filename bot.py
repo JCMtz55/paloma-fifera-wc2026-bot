@@ -410,14 +410,15 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         day = m["kickoff"].astimezone(LOCAL_TZ).strftime("%A, %b %d")
         by_day[day].append(m)
 
-    lines = [f"📅 *Matches this week:*\n"]
+    lines = ["📅 *Matches this week*"]
     for day, day_matches in by_day.items():
-        lines.append(f"*{day}*")
+        lines.append(f"\n📆 *{day}*")
         for m in day_matches:
-            lines.append(
-                f"🆚 {m['home']} vs {m['away']}  —  {group_label(m.get('group', ''))}\n"
-                f"🕐 {fmt_time(m['kickoff'])}"
-            )
+            local = m["kickoff"].astimezone(LOCAL_TZ)
+            time_str = local.strftime("%I:%M %p").lstrip("0")
+            tz_abbr = local.strftime("%Z")
+            label = group_label(m.get("group", ""))
+            lines.append(f"`{time_str} {tz_abbr}`  {m['home']} vs {m['away']}  ·  _{label}_")
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
