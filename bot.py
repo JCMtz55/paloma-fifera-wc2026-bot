@@ -221,6 +221,22 @@ def find_team(query: str) -> str | None:
     return exact[0] if exact else (matches[0] if len(matches) > 0 else None)
 
 
+def teams_by_group(exclude: set | None = None) -> dict:
+    """Group-stage teams keyed by group letter, optionally excluding some teams.
+
+    Groups left with no remaining teams are dropped from the result.
+    """
+    exclude = exclude or set()
+    groups: dict[str, list] = {}
+    for m in MATCHES:
+        g = m.get("group", "?")
+        groups.setdefault(g, [])
+        for team in (m["home"], m["away"]):
+            if team not in exclude and team not in groups[g]:
+                groups[g].append(team)
+    return {g: sorted(teams) for g, teams in groups.items() if teams}
+
+
 # ------------------------------------------------------------------ #
 #  Betting helpers (pure functions — unit tested)                     #
 # ------------------------------------------------------------------ #
@@ -685,22 +701,72 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_teams(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    groups: dict[str, list] = {}
-    for m in MATCHES:
-        g = m.get("group", "?")
-        if g not in groups:
-            groups[g] = []
-        for team in (m["home"], m["away"]):
-            if team not in groups[g]:
-                groups[g].append(team)
+    eliminated: set = context.bot_data.get("eliminated", set())
+    groups = teams_by_group(exclude=eliminated)
 
-    lines = ["🌍 *World Cup 2026 Teams:*\n"]
+    if not groups:
+        await reply_ephemeral(update, context, "All teams have been eliminated! 🏆")
+        return
+
+    lines = ["🌍 *Active Teams:*\n"]
     for g in sorted(groups):
-        teams = sorted(groups[g])
-        lines.append(f"*Group {g}:* {' • '.join(teams)}")
+        lines.append(f"*Group {g}:* {' • '.join(groups[g])}")
 
+    if eliminated:
+        lines.append(f"\n_{len(eliminated)} team(s) eliminated — see /eliminated_")
     lines.append("\nUse /register followed by the team name to add it to your list.")
     await reply_ephemeral(update, context, "\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_eliminated(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    save_user_name(context, update.effective_user)
+    eliminated: set = context.bot_data.setdefault("eliminated", set())
+
+    # No args → anyone can view the list of eliminated teams.
+    if not context.args:
+        if not eliminated:
+            await reply_ephemeral(update, context, "✅ No teams have been eliminated yet.")
+            return
+        lines = ["❌ *Eliminated teams:*\n"]
+        lines += [f"• {t}" for t in sorted(eliminated)]
+        await reply_ephemeral(update, context, "\n".join(lines), parse_mode="Markdown")
+        return
+
+    # With a team arg → admin marks a team as eliminated.
+    if update.effective_user.id != ADMIN_ID:
+        await reply_ephemeral(update, context, "❌ Only the admin can mark teams as eliminated.")
+        return
+
+    team = find_team(" ".join(context.args))
+    if not team:
+        await reply_ephemeral(update, context, "❌ Team not found. Use /teams to see all team names.")
+        return
+
+    if team in eliminated:
+        await reply_ephemeral(update, context, f"*{team}* is already eliminated.", parse_mode="Markdown")
+        return
+
+    eliminated.add(team)
+    await reply_ephemeral(update, context, f"❌ *{team}* has been eliminated.", parse_mode="Markdown")
+
+
+async def cmd_revive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await reply_ephemeral(update, context, "❌ You don't have permission to use this command.")
+        return
+
+    if not context.args:
+        await reply_ephemeral(update, context, "Usage: /revive Mexico")
+        return
+
+    team = find_team(" ".join(context.args))
+    eliminated: set = context.bot_data.setdefault("eliminated", set())
+    if not team or team not in eliminated:
+        await reply_ephemeral(update, context, "❌ That team isn't on the eliminated list.")
+        return
+
+    eliminated.remove(team)
+    await reply_ephemeral(update, context, f"✅ *{team}* is back in — removed from the eliminated list.", parse_mode="Markdown")
 
 
 async def cmd_register(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1326,7 +1392,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/tomorrow — All matches tomorrow\n"
         "/group A — Full schedule for a group (A-L)\n"
         "/schedule Mexico — All matches for a specific team\n"
-        "/teams — List all teams by group\n"
+        "/teams — List active teams by group\n"
+        "/eliminated — See which teams are out\n"
         "/register Mexico — Add a team to your personal list\n"
         "/unregister Mexico — Remove a team from your list\n"
         "/myteams — Your teams and their next matches\n"
@@ -1368,6 +1435,8 @@ def main() -> None:
     app.add_handler(CommandHandler("group", cmd_group))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
     app.add_handler(CommandHandler("teams", cmd_teams))
+    app.add_handler(CommandHandler("eliminated", cmd_eliminated))
+    app.add_handler(CommandHandler("revive", cmd_revive))
     app.add_handler(CommandHandler("register", cmd_register))
     app.add_handler(CommandHandler("unregister", cmd_unregister))
     app.add_handler(CommandHandler("myteams", cmd_myteams))
