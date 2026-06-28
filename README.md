@@ -33,10 +33,14 @@ Create a `.env` file:
 ```
 BOT_TOKEN=your_telegram_bot_token
 CHAT_ID=your_group_chat_id
+ADMIN_ID=your_telegram_user_id        # optional — enables admin commands
+FOOTBALL_API_KEY=your_api_key         # optional — enables daily schedule sync
+AUTO_DELETE_MINUTES=5                 # optional — auto-delete command replies (0 = never)
 ```
 
 - Get a bot token from [@BotFather](https://t.me/BotFather)
 - Get your group chat ID by adding the bot to the group, sending a message, and visiting `https://api.telegram.org/botYOUR_TOKEN/getUpdates`
+- `AUTO_DELETE_MINUTES` only removes the bot's own command replies; match alerts and bet-settlement announcements are kept. Defaults to 5; set to `0` to disable.
 
 ### 3. Run locally
 
