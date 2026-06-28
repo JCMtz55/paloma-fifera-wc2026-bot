@@ -16,6 +16,7 @@ from bot import (
     compute_odds,
     settle_match,
     outcome_team_label,
+    teams_by_group,
 )
 
 UTC = timezone.utc
@@ -326,3 +327,33 @@ def test_settle_match_solo_winner_gets_stake_back():
     records, no_winners = settle_match(bets, "home")
     assert not no_winners
     assert records[0]["payout"] == 100      # min ratio 1.0x → stake back
+
+
+# ------------------------------------------------------------------ #
+#  teams_by_group                                                     #
+# ------------------------------------------------------------------ #
+
+def test_teams_by_group_includes_all_when_no_exclusion():
+    groups = teams_by_group()
+    assert "Mexico" in groups["A"]
+    assert "South Korea" in groups["A"]
+    # every group-stage group should have exactly 4 teams
+    assert len(groups["A"]) == 4
+
+
+def test_teams_by_group_excludes_eliminated():
+    groups = teams_by_group(exclude={"Mexico"})
+    assert "Mexico" not in groups["A"]
+    assert "South Korea" in groups["A"]
+    assert len(groups["A"]) == 3
+
+
+def test_teams_by_group_drops_fully_eliminated_group():
+    full_group_a = set(teams_by_group()["A"])
+    groups = teams_by_group(exclude=full_group_a)
+    assert "A" not in groups
+
+
+def test_teams_by_group_sorted():
+    groups = teams_by_group()
+    assert groups["A"] == sorted(groups["A"])
