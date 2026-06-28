@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.error import TelegramError
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, PicklePersistence
 
 from schedule import MATCHES
@@ -78,6 +78,7 @@ GROUP_STAGE = set("ABCDEFGHIJKL")
 STARTING_BALANCE = 500
 MIN_BET = 10
 BET_CUTOFF = timedelta(minutes=10)  # bets lock 10 min before kickoff
+TOPUP_AMOUNT = 100  # bailout handed out to broke bettors via /topup
 
 OUTCOME_EMOJI = {"home": "🟢", "away": "🔴", "draw": "🤝"}
 
@@ -416,7 +417,8 @@ async def check_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
 
                     text += fmt_odds_inline(match, context)
 
-                    await context.bot.send_message(
+                    await safe_send_message(
+                        context.bot,
                         chat_id=CHAT_ID,
                         text=text,
                         parse_mode="Markdown",
@@ -471,7 +473,8 @@ async def sync_schedule(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"🆚 *{m['home']} vs {m['away']}*  —  {group_label(m.get('group', ''))}\n"
                 f"🕐 {fmt_time(m['kickoff'])}"
             )
-        await context.bot.send_message(
+        await safe_send_message(
+            context.bot,
             chat_id=CHAT_ID,
             text="\n\n".join(lines),
             parse_mode="Markdown",
@@ -490,9 +493,26 @@ async def _delete_message_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         pass  # already deleted, or older than Telegram's 48h delete window
 
 
+async def safe_send_message(bot, chat_id, text, **kwargs):
+    """Send a message, falling back to plain text if Markdown parsing fails."""
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except BadRequest as e:
+        log.warning(f"send_message failed ({e}); retrying without parse_mode")
+        kwargs.pop("parse_mode", None)
+        return await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+
+
 async def reply_ephemeral(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, **kwargs):
     """Reply to a command and auto-delete the reply after AUTO_DELETE_MINUTES."""
-    msg = await update.message.reply_text(text, **kwargs)
+    try:
+        msg = await update.message.reply_text(text, **kwargs)
+    except BadRequest as e:
+        # Usually a Markdown parse failure from a stray special char in dynamic
+        # content. Retry as plain text so the user always gets a reply.
+        log.warning(f"reply_text failed ({e}); retrying without parse_mode")
+        kwargs.pop("parse_mode", None)
+        msg = await update.message.reply_text(text, **kwargs)
     if AUTO_DELETE_MINUTES > 0:
         context.job_queue.run_once(
             _delete_message_job,
@@ -882,7 +902,7 @@ async def settle_bets(context: ContextTypes.DEFAULT_TYPE, team: str, result_type
         text += "\n*Winners:*\n" + "\n".join(winner_lines)
 
     try:
-        await context.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
+        await safe_send_message(context.bot, chat_id=CHAT_ID, text=text, parse_mode="Markdown")
     except TelegramError as e:
         log.error(f"Failed to send settlement announcement: {e}")
 
@@ -1259,6 +1279,40 @@ async def cmd_cancelbet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def cmd_topup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != ADMIN_ID:
+        await reply_ephemeral(update, context, "❌ You don't have permission to use this command.")
+        return
+
+    wallets: dict = context.bot_data.setdefault("wallets", {})
+    user_names: dict = context.bot_data.get("user_names", {})
+
+    topped = [uid for uid, balance in wallets.items() if balance <= 0]
+    if not topped:
+        await reply_ephemeral(update, context, "No users are at 0 coins — nobody needs a top-up.")
+        return
+
+    for uid in topped:
+        wallets[uid] = TOPUP_AMOUNT
+
+    names = ", ".join(user_names.get(uid, f"User{uid[-4:]}") for uid in topped)
+    count = len(topped)
+    await reply_ephemeral(update, context, f"✅ Topped up {count} broke {'bettor' if count == 1 else 'bettors'} to {TOPUP_AMOUNT} 🪙.")
+
+    try:
+        await safe_send_message(
+            context.bot,
+            chat_id=CHAT_ID,
+            text=(
+                f"🎁 *Bailout!* {count} broke {'bettor' if count == 1 else 'bettors'} "
+                f"got a fresh {TOPUP_AMOUNT} 🪙 to get back in the game:\n{names}"
+            ),
+            parse_mode="Markdown",
+        )
+    except TelegramError as e:
+        log.error(f"Failed to send top-up announcement: {e}")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "⚽ *World Cup 2026 Bot*\n\n"
@@ -1287,6 +1341,14 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/betleaderboard — Betting standings"
     )
     await reply_ephemeral(update, context, text, parse_mode="Markdown")
+
+
+# ------------------------------------------------------------------ #
+#  Error handler                                                       #
+# ------------------------------------------------------------------ #
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Exception while handling an update:", exc_info=context.error)
 
 
 # ------------------------------------------------------------------ #
@@ -1319,7 +1381,10 @@ def main() -> None:
     app.add_handler(CommandHandler("mybets", cmd_mybets))
     app.add_handler(CommandHandler("betleaderboard", cmd_betleaderboard))
     app.add_handler(CommandHandler("cancelbet", cmd_cancelbet))
+    app.add_handler(CommandHandler("topup", cmd_topup))
     app.add_handler(CommandHandler("help", cmd_help))
+
+    app.add_error_handler(on_error)
 
     app.job_queue.run_repeating(check_schedule, interval=60, first=10)
     app.job_queue.run_once(sync_schedule, when=5)  # sync immediately on startup
