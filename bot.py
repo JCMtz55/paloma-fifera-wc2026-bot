@@ -1040,6 +1040,7 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     registrations: dict = context.bot_data.get("registrations", {})
     user_names: dict = context.bot_data.get("user_names", {})
     team_results: dict = context.bot_data.get("team_results", {})
+    eliminated: set = context.bot_data.get("eliminated", set())
 
     if not registrations:
         await reply_ephemeral(update, context, "No users registered yet. Use /register to join.")
@@ -1060,7 +1061,10 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     lines = ["🏆 *Leaderboard:*\n"]
     for i, s in enumerate(scores):
         rank = medals[i] if i < 3 else f"{i + 1}\\."
-        teams_str = " • ".join(s["teams"])
+        teams_str = " • ".join(
+            f"❌ {t}" if t in eliminated else t
+            for t in s["teams"]
+        )
         lines.append(
             f"{rank} *{s['name']}* — {s['points']} pts | {s['goals']} goals\n"
             f"   {teams_str}"
